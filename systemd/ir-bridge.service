@@ -1,0 +1,79 @@
+[Unit]
+Description=EchoBridge IR Bridge (addon)
+# 本体とネット到達後に開始。ただし Requires= は入れない設計判断（HAP版・Matter版と同じ）:
+# 本体restart時にアドオンを道連れにしない。
+# ★骨格段階の本アドオンは本体API(:8099)を一切叩かないため、この順序制約は現状は無意味である。
+#   将来IR実装が本体APIを消費する（例: シーン発火に赤外線を紐づける）ときのために先に置く。
+#   After= は「起動していれば先に」でしかなく、本体不達でも本アドオンは起動する。
+After=network-online.target echobridge-shortcut-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=%REPO%
+# 起動時ローテ: error_addon.log が1MB超なら .old へ退避（世代1・上書き）。
+# systemdがStandardErrorでファイルを開く前に走るためappendのinode問題を踏まない。
+# クラッシュループでも再起動毎に走るので最悪1MB+αで頭打ち。%%s はunit内で%sへ復元される。
+ExecStartPre=/bin/sh -c '[ -f %REPO%/data/error_addon.log ] && [ $(stat -c%%s %REPO%/data/error_addon.log) -gt 1048576 ] && mv -f %REPO%/data/error_addon.log %REPO%/data/error_addon.log.old || true'
+# ログの権限を data/ の他の生成物（status.json＝600）と揃える。
+# StandardError=append: は mode を指定できず、systemd が新規作成すると root:root 644 になる。
+# systemd がファイルを開く**前に**先回りして作成し 600 を立てることで 644 の瞬間を作らない。
+# ★この行は User=%USER% 権限で走るため、root所有で作られた既存ファイルには touch も chmod も
+#   失敗する。所有権の移行は root で走る install.sh 側の責任とし、ここは末尾 true で
+#   **失敗しても起動を妨げない**（install.sh を経ずに手で起動した機体で上がらなくなるのを避ける）。
+ExecStartPre=/bin/sh -c 'f=%REPO%/data/error_addon.log; touch "$f" 2>/dev/null; chmod 600 "$f" 2>/dev/null; true'
+ExecStart=%PYTHON% -m ir_bridge.main
+# 標準ライブラリのみで動く＝venvもrequirements.txtも持たない（CLAUDE.md §8）。
+# stdoutがpipe(journal)だとPythonはブロックバッファする＝ログが数KB溜まるまで出ない。
+# 本体webuiのunitと同じくバッファを切り、INFOが即journalへ届くようにする。
+Environment=PYTHONUNBUFFERED=1
+# /dev/lirc0・/dev/lirc1 は root:video 660。IR送受信の実装（M2以降）でこれを開く。
+# 骨格の時点で入れておくのは、あとから足すと「動かない原因はこれ」の切り分けを毎回踏むため。
+# ★SupplementaryGroups= は User= のユーザが /etc/group 経由で属する群を**置換せず、加える**
+#   （dev機の echobridge は既に video 所属なので実質no-opだが、非所属の機体でも効く保険）。
+SupplementaryGroups=video
+# 日常ログ(INFO)はstdout→journal(RAM・揮発)。WARNING以上のstderrだけを
+# data/error_addon.log へ永続＝本体のerror.log思想(ERROR+必要WARNINGのみ永続)と同型。
+# 振り分けはアドオン側 ir_bridge/main.py の _setup_logging が行う。
+# ファイル名は全アドオン共通で error_addon.log 固定（本体診断が addons/*/data/ を1globで拾う規約）。
+StandardOutput=journal
+StandardError=append:%REPO%/data/error_addon.log
+# 本体URLの注入点（CLAUDE.md §4: ハードコード禁止・既定は同一機のループバック）。
+# M2で受信コード→シーン発火のためにこのURLを実際に叩くようになったので追加した
+# （M1では「コードが読まない変数はunitに置かない」として意図的に省いていた）。
+# ★127.0.0.1 であることが、本体の localhost 免除（API_CONTRACT.md §1）の条件である。
+#   本アドオンは鍵（?key=）を送る手段を持たないので、この値を LAN のアドレス
+#   （例 http://192.168.x.x:8099・http://echobridge.local:8099）に変えると、
+#   本体のトークン認証が ON のとき全リクエストが 401 になる（localhost は免除の対象）。
+Environment=ECHOBRIDGE_URL=http://127.0.0.1:8099
+# 受信に使う lircデバイス。auto＝受信できる最初の1台（RXが1つだけの機体はこれで足りる）。
+# RXが複数ある機体（GPIOのVS1838B + USBのIrdroid 等）は data/env で明示する。
+#   IR_BRIDGE_RX_DEVICE=ir_toy       ← USB機はドライバ名で指定する（下の注記）
+#   IR_BRIDGE_RX_DEVICE=/dev/lirc2   ← パスでも書ける（`lirc2` / `2` も可）
+# ★USB機をパスで指定しない。/dev/lircN の番号は接続順・起動順で動く（実測: Irdroidは
+#   lirc2 だが、GPIOのoverlayより先に列挙されれば別番号になりうる）。ドライバ名なら動かない。
+# 名前は起動ログの「lircデバイス: … 名前=…」の行に出る（dev機: gpio-ir-tx / gpio_ir_recv / ir_toy）。
+# 合致するデバイスが無いときは**自動選択に落とさず待つ**＝別のセンサで黙って受け続けない。
+Environment=IR_BRIDGE_RX_DEVICE=auto
+# data/env は上の既定を上書きする場合に使う（後勝ち。例: IR_BRIDGE_RX_DEVICE）。
+# ★本体を別機に置く構成（ECHOBRIDGE_URL を別機のアドレスにする）は、本体のトークン認証が
+#   OFF のときしか成立しない。トークン ON では全リクエストが 401 になる。
+#   本アドオンには鍵を渡す手段（HAP版・Matter版の ECHOBRIDGE_TOKEN に相当するもの）が無く、
+#   本体への到達を localhost 免除（API_CONTRACT.md §1）に完全に依存しているため。
+# 同一機なら本体がループバック接続を認証の検査対象外にするためトークンは不要＝env自体が不要。
+# "-" でファイル不在でも起動する（同一機運用では不在が既定）。
+EnvironmentFile=-%REPO%/data/env
+Restart=on-failure
+RestartSec=5
+# 実測（骨格・Python標準ライブラリのみ）は RSS≈12MiB / cgroup課金≈6MiB。上限は本体webui(200M)と同値に置き、
+# Matter版(300M)より小さくする＝逼迫時にはMatterより先に本アドオンが死ぬ順序にはならないが、
+# 本体(未設定=0)より先に死ぬ側であることは下のOOMScoreAdjustで担保する。
+# 200Mは将来のIR実装（コードDB・lirc入出力）への余裕であって、現状の実測に対しては過大である。
+# IR実装後に実測し直して締める（DEV_LOG 2026-08-14）。
+MemoryMax=200M
+# 本体(未設定=0)より先にkillされる側＝「逼迫時に死ぬのはアドオン側」(CLAUDE.md §4)の実装。
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target
