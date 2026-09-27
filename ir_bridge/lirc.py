@@ -37,6 +37,8 @@ import select
 import struct
 from typing import NamedTuple
 
+from .warnlimit import WarnLimiter, suffix
+
 logger = logging.getLogger(__name__)
 
 # --- lirc.h の値（typeは 'i'・引数は __u32） ---------------------------------
@@ -152,17 +154,32 @@ def _read_names(path: str) -> tuple[str | None, str | None]:
     return fields.get("DRV_NAME") or None, fields.get("DEV_NAME") or None
 
 
+# probe の WARNING の間引き（W18 R-2・§6-2）。find_devices() は受信スレッドがデバイスを見失っている間
+# 5秒ごとに呼ぶ（receiver.RETRY_SEC）ほか、設定UI・送信・診断からも呼ばれる。/dev/lirc* が在るのに
+# 開けない状態（video 群が効いていない等）が続くと、間引かなければデバイス数×5秒ごとに1行
+# 永続ログへ出続ける。理由は (段階, パス, errno)。間引いた回は DEBUG（5秒ごとなので journal も汚さない）。
+_probe_warn = WarnLimiter()
+
+
+def _warn_probe(stage: str, message: str, path: str, e: OSError) -> None:
+    suppressed = _probe_warn.take((stage, path, e.errno), f"{path} の{stage}")
+    if suppressed is None:
+        logger.debug("%s（間引き中）: %s — %s", message, path, e)
+    else:
+        logger.warning("%s: %s — %s%s", message, path, e, suffix(suppressed))
+
+
 def probe(path: str) -> LircDevice | None:
-    """1台の features を読む。開けない／ioctlが通らないデバイスは None（WARNINGで継続）。"""
+    """1台の features を読む。開けない／ioctlが通らないデバイスは None（WARNINGで継続・理由ごとに間引く）。"""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as e:
-        logger.warning("lircデバイスを開けない（無視して継続）: %s — %s", path, e)
+        _warn_probe("open", "lircデバイスを開けない（無視して継続）", path, e)
         return None
     try:
         features = _get_u32(fd, LIRC_GET_FEATURES)
     except OSError as e:
-        logger.warning("LIRC_GET_FEATURES に失敗（無視して継続）: %s — %s", path, e)
+        _warn_probe("features", "LIRC_GET_FEATURES に失敗（無視して継続）", path, e)
         return None
     finally:
         os.close(fd)

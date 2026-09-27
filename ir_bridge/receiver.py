@@ -7,7 +7,7 @@ polarity.py）→ デバウンス → 解釈 → 実行。
 ノードへ送信でき、自分の送信は受信しない＝止める必要が無い）。
 
 スレッド構成（M3で :8100 の設定UIを同居させる前提）:
-    メインスレッド  status.json のループ（骨格からの継続）
+    メインスレッド  status.json のループ＋スレッドの生死の見張り（main.py）
     IrReceiver      /dev/lircN を読み続ける。本モジュール
     CommandFirer    本体APIの呼び出し（受信をHTTP待ちで止めないため別スレッド）
 共有状態は RecentCodes と ConfigStore（どちらもロック付き）だけに閉じてある。
@@ -21,7 +21,7 @@ polarity.py）→ デバウンス → 解釈 → 実行。
     5. 未登録       INFO で出す（顧客宅の衝突を測る唯一の計器）
 
 learned を先に引くのは、**衝突したときに顧客の設定が勝つ**ようにするため。
-実例が data/learned.json にある: `nec32:0x7d2e5b91`（M2のテスト用SwitchBotコード）は
+実例が dev 機の learned.json にある: `nec32:0x7d2e5b91`（M2のテスト用SwitchBotコード）は
 現在の base に一致するが BB=0x91=145 で導出としては範囲外になる。learned が先なので
 これは生き続ける。
 """
@@ -44,8 +44,11 @@ RETRY_SEC = 5.0
 # ★RETRY_SEC ではない。WARNING は data/error_addon.log（永続・1MB枠）へ流れるので、
 #   5秒ごとに書くと「USBのIrdroidを抜いたまま一晩」で数MB＝枠を使い切り、本来残すべき
 #   発火失敗などが .old へ押し出される。異常が続いていることは10分に1行で足りる。
-WARN_REPEAT_SEC = 600.0
-# 同一コードの最終受信時刻を覚えておく上限（ノイズが偶然デコードできた場合の際限ない成長を防ぐ）。
+# 値は warnlimit と共有（R-1・R-2 の間引きと同じ10分）。
+from .warnlimit import WARN_REPEAT_SEC, WarnLimiter, stamp, suffix  # noqa: E402
+# 同一コードの最終受信時刻を覚えておく件数の上限（ノイズが偶然デコードできた場合の際限ない
+# 成長を防ぐ）。**超えたぶんは実際に捨てる**（W19-12。以前は「窓より古いものを掃除する契機」で
+# しかなく、宣言している上限を機械が守っていなかった）。
 _LAST_SEEN_MAX = 256
 
 
@@ -102,6 +105,10 @@ class IrReceiver:
         # ためだけにある。書くのはこのスレッドだけ・float の代入なのでロックは要らない。
         self._last_event_at = 0.0
         self._warn = _WarnThrottle()
+        # 想定外の例外（受信ループ・1イベントの処理）の WARNING を間引く（W19-14）。
+        # _WarnThrottle は「理由は1つだけ・変わればリセット」の形なので、理由が同時に
+        # 複数ありうるこちらには WarnLimiter を使う（warnlimit.py 冒頭）。
+        self._limiter = WarnLimiter()
         # (プロトコル名, 4バイト) -> 最後に「押下」として扱った時刻。デバウンスの台帳。
         # ★キーは表記文字列ではなくバイト。照合系を1本に保つ（nec.py 冒頭）。
         self._last_seen: dict[tuple[str, codes.Bytes4], float] = {}
@@ -115,6 +122,14 @@ class IrReceiver:
     def join(self, timeout: float = 3.0) -> None:
         self._thread.join(timeout=timeout)
 
+    def is_alive(self) -> bool:
+        """受信スレッドが生きているか（常駐ループの見張り用・W19-14）。
+
+        start() 前は True を返す（まだ死んでいない）。**死んだまま「稼働中」に見せない**ために、
+        main の常駐ループがこれを60秒ごとに見る。
+        """
+        return self._thread.ident is None or self._thread.is_alive()
+
     @property
     def last_event_at(self) -> float:
         """最後に生イベント（pulse/space/timeout 等）を受けた monotonic 時刻。未受信なら 0.0。"""
@@ -122,47 +137,97 @@ class IrReceiver:
 
     # --- 内部 -----------------------------------------------------------------
     def _run(self) -> None:
+        """受信スレッドの本体。**どんな例外でもここから外へ出さない**（W19-14）。
+
+        スレッドが例外で終わると `logger.info("受信スレッド停止")` は出ず、代わりに
+        threading.excepthook が fd 2 へ直接トレースバックを書く（logging を通らない＝
+        永続ログの回転も起きない。errlog.py 冒頭）。そのうえ本体カードは「稼働中」のまま、
+        status.json も更新され続けるのに赤外線だけが効かない——**死んだまま稼働中に見える**
+        状態になる。1件の失敗でスレッドを失わず、外からも気づけるようにする
+        （生死は main の常駐ループが is_alive で見る）。
+        """
         stop = self._stop
         assert stop is not None
         while not stop.is_set():
-            device = lirc.find_rx_device(self._rx_spec)
-            if device is None:
-                self._warn_no_device()
-                if stop.wait(RETRY_SEC):
-                    return
-                continue
-
-            recovered = self._warn.clear()
-            logger.info(
-                "%s: %s（%s 役割=%s）%s",
-                "受信デバイスに復帰" if recovered else "受信デバイス",
-                device.path,
-                device.label,
-                device.role,
-                "" if self._rx_spec is None else f" ← {lirc.RX_DEVICE_ENV}={self._rx_spec} に合致",
-            )
-            reader = lirc.Mode2Reader(device.path)
             try:
-                reader.open()
-                self._decoder.reset()
-                for kind, usec in reader.events(stop):
-                    self._feed(device, kind, usec)
-            except OSError as e:
-                # 同じ理由で読めない状態が続く間は間引く（永続ログの枠を守る。WARN_REPEAT_SEC）。
-                held = self._warn.take(f"read:{device.path}:{e.errno}")
-                if held is not None:
+                if self._cycle(stop):
+                    break
+            except Exception:  # noqa: BLE001
+                released = self._limiter.take(("receiver_unexpected",), "受信ループの想定外の例外")
+                if released is None:
+                    logger.info("受信ループで想定外の例外（間引き中・%.0f秒後に再開する）", RETRY_SEC, exc_info=True)
+                else:
                     logger.warning(
-                        "受信が中断した（%.0f秒ごとに再開を試みる%s）: %s — %s",
+                        "受信ループで想定外の例外（%.0f秒後に再開する）%s",
                         RETRY_SEC,
-                        "" if held < 1 else f"・{held / 60:.0f}分継続中",
-                        device.path,
-                        e,
+                        suffix(released),
+                        exc_info=True,
                     )
                 if stop.wait(RETRY_SEC):
-                    return
-            finally:
-                reader.close()
+                    break
+        # 間引いたまま次の1行が来なかった件数を回収する（件数は失わない。warnlimit 冒頭）。
+        pending = self._limiter.drain()
+        if pending:
+            logger.warning(
+                "停止までに間引いた WARNING: %s",
+                "、".join(f"{label} {n} 件（最後は {stamp(last)}）" for label, n, last in pending),
+            )
         logger.info("受信スレッド停止")
+
+    def _cycle(self, stop) -> bool:
+        """受信デバイスを1台つかんで読めるだけ読む。停止すべきなら True。"""
+        device = lirc.find_rx_device(self._rx_spec)
+        if device is None:
+            self._warn_no_device()
+            return stop.wait(RETRY_SEC)
+
+        recovered = self._warn.clear()
+        logger.info(
+            "%s: %s（%s 役割=%s）%s",
+            "受信デバイスに復帰" if recovered else "受信デバイス",
+            device.path,
+            device.label,
+            device.role,
+            "" if self._rx_spec is None else f" ← {lirc.RX_DEVICE_ENV}={self._rx_spec} に合致",
+        )
+        reader = lirc.Mode2Reader(device.path)
+        try:
+            reader.open()
+            self._decoder.reset()
+            for kind, usec in reader.events(stop):
+                self._feed_guarded(device, kind, usec)
+        except OSError as e:
+            # 同じ理由で読めない状態が続く間は間引く（永続ログの枠を守る。WARN_REPEAT_SEC）。
+            held = self._warn.take(f"read:{device.path}:{e.errno}")
+            if held is not None:
+                logger.warning(
+                    "受信が中断した（%.0f秒ごとに再開を試みる%s）: %s — %s",
+                    RETRY_SEC,
+                    "" if held < 1 else f"・{held / 60:.0f}分継続中",
+                    device.path,
+                    e,
+                )
+            return stop.wait(RETRY_SEC)
+        finally:
+            reader.close()
+        return False
+
+    def _feed_guarded(self, device, kind: int, usec: int) -> None:
+        """1イベントの処理で例外が出ても**読み続ける**（デバイスを開き直さない）。
+
+        開き直すと1フレームごとに RETRY_SEC の空白ができ、その間の赤外線を落とす。
+        ここで止めたいのは「1件の失敗で受信を失うこと」だけなので、次のイベントへ進む。
+        """
+        try:
+            self._feed(device, kind, usec)
+        except Exception:  # noqa: BLE001
+            released = self._limiter.take(("feed_unexpected",), "受信イベントの処理で想定外の例外")
+            if released is None:
+                logger.info("受信イベントの処理で想定外の例外（間引き中・読み続ける）", exc_info=True)
+            else:
+                logger.warning(
+                    "受信イベントの処理で想定外の例外（読み続ける）%s", suffix(released), exc_info=True
+                )
 
     def _warn_no_device(self) -> None:
         """デバイスが取れない理由を、指定の有無で書き分ける（原因の切り分けが変わるため）。
@@ -244,6 +309,7 @@ class IrReceiver:
         self._recent.record(
             frame.code, frame.protocol, summary, interp.source, fired,
             target=codes.target_info(interp.target),
+            display=interp.display,
         )
         self._log(frame, interp, fired)
 
@@ -267,7 +333,10 @@ class IrReceiver:
         if derived is not None:
             return derived
 
-        return codes.Interpretation(None, "未登録（learned にも導出にも一致せず）", "unknown")
+        return codes.Interpretation(
+            None, "未登録（learned にも導出にも一致せず）", "unknown",
+            display="登録されていないボタンです（何もしません）",
+        )
 
     def _log(self, frame, interp, fired: bool) -> None:
         """§26-10 のログ規律: **1行目だけ読んで成功と誤読させない**。
@@ -304,7 +373,17 @@ class IrReceiver:
             logger.info("受信 %s → %s", frame.code, interp.reason)
 
     def _prune_last_seen(self, now: float, debounce_ms: int) -> None:
+        """デバウンスの台帳を _LAST_SEEN_MAX 件以内に保つ（W19-12）。
+
+        まずデバウンス窓より古い項目を落とす（実機ではこれだけで十数件に収まる——NEC の
+        フレーム周期は約110ms で、既定の窓は1000ms）。それでも超えるなら**古い順に捨てる**。
+        捨てた分はそのコードのデバウンスが一度効かなくなるだけ（実行が重なるのは最大1回）で、
+        宣言している上限を機械が守らないほうが悪い。
+        """
         if len(self._last_seen) <= _LAST_SEEN_MAX:
             return
         window = debounce_ms / 1000.0
         self._last_seen = {c: t for c, t in self._last_seen.items() if now - t < window}
+        if len(self._last_seen) > _LAST_SEEN_MAX:
+            newest = sorted(self._last_seen.items(), key=lambda kv: kv[1], reverse=True)
+            self._last_seen = dict(newest[:_LAST_SEEN_MAX])

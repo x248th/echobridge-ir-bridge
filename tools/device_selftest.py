@@ -14,8 +14,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tools/
 
-from ir_bridge import lirc  # noqa: E402
+import isolation  # noqa: E402  ← ir_bridge より先に（置き場所ごと一時ディレクトリへ逃がす・前後で本物を見張る）
+
+import logging  # noqa: E402
+
+from ir_bridge import lirc, main as main_mod  # noqa: E402
 from ir_bridge.lirc import LircDevice  # noqa: E402
 from ir_bridge.receiver import _WarnThrottle  # noqa: E402
 
@@ -56,6 +61,72 @@ def spec_from_env(value):
             os.environ.pop(lirc.RX_DEVICE_ENV, None)
         else:
             os.environ[lirc.RX_DEVICE_ENV] = saved
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append((record.levelname, record.getMessage()))
+
+    def of(self, level):
+        return [m for lv, m in self.records if lv == level]
+
+    def __enter__(self):
+        root = logging.getLogger("ir_bridge")
+        self._saved = root.level
+        root.setLevel(logging.DEBUG)
+        root.addHandler(self)
+        return self
+
+    def __exit__(self, *exc):
+        root = logging.getLogger("ir_bridge")
+        root.removeHandler(self)
+        root.setLevel(self._saved)
+
+
+def _log_devices_with(devices, spec):
+    """main._log_devices を合成デバイス表で走らせる（実機の /dev/lirc* を見ない）。"""
+    saved = lirc.find_devices
+    lirc.find_devices = lambda: list(devices)
+    try:
+        with _Capture() as cap:
+            main_mod._log_devices(spec)
+        return cap
+    finally:
+        lirc.find_devices = saved
+
+
+def auto_warning_section() -> None:
+    """W19-10: RX が複数あるのに auto のとき、起動ログに1行添える。"""
+    print("■ W19-10 RXが複数あるのに auto なら、起動ログに1行添える（再インストールで指定が消える）")
+    cap = _log_devices_with(DEVICES, None)
+    warns = [m for m in cap.of("WARNING") if "auto" in m]
+    check("  ★1行出る（旧実装は黙って最初の1台を選んだ）", len(warns) == 1, str(cap.of("WARNING")))
+    check("    何台あるかと、どれを使うかを書く",
+          warns and "2 台" in warns[0] and GPIO_RX.path in warns[0], str(warns))
+    check("    直し方（data/env で指定する）も書く",
+          warns and lirc.RX_DEVICE_ENV in warns[0] and "data/env" in warns[0], str(warns))
+    check("  1起動につき1行だけ（永続ログの1MB枠を食わない）", len(cap.of("WARNING")) == 1, str(cap.of("WARNING")))
+
+    print("■ W19-10 影響を広げない（製品機＝RX 1台・指定あり、では出ない）")
+    cap = _log_devices_with([GPIO_TX, IRDROID], None)
+    check("  RX が1台なら出ない（製品機は Irdroid 1台）", cap.of("WARNING") == [], str(cap.of("WARNING")))
+    cap = _log_devices_with(DEVICES, "ir_toy")
+    check("  指定があれば出ない（auto ではない）", cap.of("WARNING") == [], str(cap.of("WARNING")))
+    cap = _log_devices_with([GPIO_TX], None)
+    check("  TX しか無いなら出さない（受信スレッドが「見つからない」を出す・既存の判断）",
+          cap.of("WARNING") == [], str(cap.of("WARNING")))
+    cap = _log_devices_with([], None)
+    check("  /dev/lirc* が1つも無いときは従来どおり「見つからない」1行だけ",
+          len(cap.of("WARNING")) == 1 and "見つからない" in cap.of("WARNING")[0], str(cap.of("WARNING")))
+    cap = _log_devices_with(DEVICES, "no-such-device")
+    check("  指定が外れていても、ここでは出さない（受信スレッドが出す・既存の判断）",
+          cap.of("WARNING") == [], str(cap.of("WARNING")))
+    check("  一覧の INFO は従来どおり（デバイス数＋指定の1行）",
+          len(_log_devices_with(DEVICES, None).of("INFO")) == 1 + len(DEVICES))
 
 
 def main() -> int:
@@ -149,6 +220,8 @@ def main() -> int:
         always.take("x") == 0.0 and always.take("x") is not None,
     )
 
+    auto_warning_section()
+
     print("■ 参考: この機体の実物（試験対象ではない）")
     found = lirc.find_devices()
     for d in found:
@@ -172,4 +245,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(isolation.run(main))

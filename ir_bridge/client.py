@@ -27,6 +27,7 @@ ECHOBRIDGE_TOKEN に相当する口が無い）。その結果、本体への到
 ＝赤外線を押しても何も起きず、data/error_addon.log に行が溜まるだけの状態になる。
 get_scenes / get_lights（設定UIの一覧取得）も同じく ClientError になる。
 """
+import http.client
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ import urllib.parse
 import urllib.request
 
 from .codes import LightTarget, SceneTarget
+from .warnlimit import WarnLimiter, stamp, suffix
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +73,11 @@ class EchoBridgeClient:
         except urllib.error.HTTPError as e:
             # 契約: 400/401/404/502/500。error文字列の中身は契約ではないので分岐に使わない。
             raise ClientError(f"HTTP {e.code} {url}", status=e.code) from e
-        except (urllib.error.URLError, OSError) as e:
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+            # ★http.client.HTTPException（IncompleteRead・BadStatusLine・LineTooLong）は
+            #   OSError の派生では**ない**。ValueError は ECHOBRIDGE_URL にスキームが無いとき
+            #   urlopen が投げる。包まないとワーカースレッドの外へ抜けてスレッドが終わり、
+            #   以後シーンも照明も二度と動かない（W19-1）。
             raise ClientError(f"接続失敗 {url}: {e}") from e
         try:
             payload = json.loads(body)
@@ -109,6 +115,16 @@ class CommandFirer:
     受信スレッドが止まると、カーネルのlircバッファが溢れて次の赤外線を取りこぼす。
     キューが詰まるほど連投された場合は**捨てる**（WARNING）。押しっぱなしのリモコンで
     キューが伸び続け、指を離した後も発火が続く、という挙動のほうが有害なため。
+
+    ■ WARNING の間引き（W18 R-1・§6-2）
+    実行の失敗とキュー満杯は**受信が引き金**なので、頻度はこちらで制御できない（本体に繋がらない間に
+    フルフレームを送り直すリモコンを長押しすると、デバウンスを抜けるたびに1行＝約1秒に1行）。
+    理由ごとに10分に1行へ間引き（warnlimit.WarnLimiter）、間引いた件数は次の1行に
+    「（この間に同じ失敗が N 件・最後は YYYY-MM-DD HH:MM）」と添える。停止時に残っている件数も1行にまとめて
+    出す（理由ごとに「（最後は …）」付き。warnlimit 冒頭）。
+    間引いた1回ずつは INFO（journal）に残す——「押したのに動かなかった」の証跡を失わない。
+    理由のキー: 接続できない（status なし）は宛先によらず1つ。HTTP の失敗（404・400・502 …）は
+    宛先ごと（どのシーン・照明が 404 なのかが、直すための情報なので）。
     """
 
     QUEUE_MAX = 8
@@ -118,6 +134,7 @@ class CommandFirer:
         self._q: queue.Queue = queue.Queue(maxsize=self.QUEUE_MAX)
         self._thread = threading.Thread(target=self._run, name="CommandFirer", daemon=True)
         self._stopped = threading.Event()
+        self._limiter = WarnLimiter()
 
     def start(self) -> None:
         self._thread.start()
@@ -131,10 +148,22 @@ class CommandFirer:
             self._q.put_nowait((target, code))
             return True
         except queue.Full:
-            logger.warning(
-                "実行キューが一杯のため破棄: %s（受信コード %s）", target.summary, code
-            )
+            suppressed = self._limiter.take("queue_full", "実行キューが一杯のため破棄")
+            if suppressed is None:
+                logger.info("実行キューが一杯のため破棄（間引き中）: %s（受信コード %s）", target.summary, code)
+            else:
+                logger.warning(
+                    "実行キューが一杯のため破棄: %s（受信コード %s）%s", target.summary, code, suffix(suppressed)
+                )
             return False
+
+    def is_alive(self) -> bool:
+        """ワーカースレッドが生きているか（常駐ループの見張り用・W19-14）。
+
+        start() 前は True を返す（まだ死んでいない）。死んだままの「稼働中」を残さないために、
+        main の常駐ループがこれを60秒ごとに見る。
+        """
+        return self._thread.ident is None or self._thread.is_alive()
 
     def stop(self, timeout: float = 3.0) -> None:
         """停止する。**キューに残った実行は捨てる**（意図的な仕様）。
@@ -152,7 +181,15 @@ class CommandFirer:
         if self._thread.ident is not None:
             # start() 済みのときだけ番兵を置いて待つ。起動前に停止しても落とさない
             # （起動途中の異常で stop() だけ呼ばれる経路があっても、破棄の記録は残す）。
-            self._q.put(None)
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                # ★待つ put にしない（W19-2）。ワーカーが死んでいてキューが満杯だと永久に
+                #   返らず、SIGTERM が systemd 既定の 90秒効かないうえ、**この下の2行の記録が
+                #   1行も残らない**（最後は SIGKILL＝logging も流れない）。
+                #   満杯なら番兵は要らない: 直後の排出でキューは空になり、ワーカーは
+                #   _stopped を見て抜ける。
+                pass
             self._thread.join(timeout=timeout)
         dropped = []
         while True:
@@ -167,6 +204,16 @@ class CommandFirer:
                 "終了処理のため %d 件の実行を破棄した（再起動・停止の最中に受信したもの）: %s",
                 len(dropped),
                 "、".join(t.summary for t in dropped),
+            )
+        # 間引いたまま次の1行が来なかった件数を回収する（件数は失わない）。停止の最中＝journal が
+        # 次の起動で消える場面なので WARNING に出す。1回の停止につき最大1行。
+        # ★理由ごとに最後に数えた時刻を添える。この行は失敗が止んでから何週間も後に書かれうるので、
+        #   添えないと「停止の直前まで失敗していた」と読まれる（warnlimit 冒頭）。
+        pending = self._limiter.drain()
+        if pending:
+            logger.warning(
+                "停止までに間引いた WARNING: %s",
+                "、".join(f"{label} {n} 件（最後は {stamp(last)}）" for label, n, last in pending),
             )
 
     # --- 内部 -----------------------------------------------------------------
@@ -194,19 +241,43 @@ class CommandFirer:
 
     def _run(self) -> None:
         while True:
-            item = self._q.get()
-            if item is None or self._stopped.is_set():
-                return
-            target, code = item
             try:
-                self._execute(target)
-                # ★成功したときだけ出る行。受信側の「実行を要求」と対になる（§26-10）。
-                logger.info("%sしました", target.summary)
-            except ClientError as e:
-                # 404・400・502・接続不可のいずれもここ。落とさない。
-                logger.warning(
-                    "%sできませんでした（%s）— %s",
-                    target.summary,
-                    self._hint(target, e.status),
-                    e,
-                )
+                if self._step():
+                    return
+            except Exception:  # noqa: BLE001
+                # ★1件の失敗でワーカーを失わない（W19-1・W19-14）。ここを抜けるとスレッドが
+                #   終わり、本体カードは「稼働中」のまま**シーンも照明も二度と動かない**
+                #   （復旧は再起動だけ）。しかもデーモンスレッドの例外は threading.excepthook が
+                #   fd 2 へ直接書く＝logging を通らないので回転も起きない（errlog.py 冒頭）。
+                #   WARNING は間引く（受信が引き金＝頻度をこちらで制御できない）。
+                released = self._limiter.take(("worker_unexpected",), "実行ワーカーの想定外の例外")
+                if released is None:
+                    logger.info("実行ワーカーで想定外の例外（間引き中・継続する）", exc_info=True)
+                else:
+                    logger.warning(
+                        "実行ワーカーで想定外の例外（継続する）%s", suffix(released), exc_info=True
+                    )
+
+    def _step(self) -> bool:
+        """キューから1件取り出して実行する。停止すべきなら True。"""
+        item = self._q.get()
+        if item is None or self._stopped.is_set():
+            return True
+        target, code = item
+        try:
+            self._execute(target)
+            # ★成功したときだけ出る行。受信側の「実行を要求」と対になる（§26-10）。
+            logger.info("%sしました", target.summary)
+        except ClientError as e:
+            # 404・400・502・接続不可のいずれもここ。落とさない。
+            hint = self._hint(target, e.status)
+            if e.status is None:
+                key, label = ("exec", hint), f"実行（{hint}）"
+            else:
+                key, label = ("exec", hint, target.summary), f"{target.summary}（{hint}）"
+            suppressed = self._limiter.take(key, label)
+            if suppressed is None:
+                logger.info("%sできませんでした（%s・間引き中）— %s", target.summary, hint, e)
+            else:
+                logger.warning("%sできませんでした（%s）— %s%s", target.summary, hint, e, suffix(suppressed))
+        return False

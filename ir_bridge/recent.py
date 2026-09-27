@@ -47,6 +47,7 @@ class RecentCodes:
         source: str,
         fired: bool,
         target: dict | None = None,
+        display: str = "",
     ) -> None:
         """新しい押下として1件積む（最古を押し出す）。
 
@@ -54,7 +55,9 @@ class RecentCodes:
         source は learned / derived / other_preset / out_of_range / unknown。
         target は宛先の構造（codes.target_info）。**設定UIが表示名を差し込むために使う**
         ——ここでは表記文字列ではなく key / instance を持つ（理由は codes.target_info）。
-        宛先が無い行（未登録・範囲外・別プリセット）は None で、画面は summary をそのまま出す。
+        宛先が無い行（未登録・範囲外・別プリセット）は None。
+        display は宛先が無い行で**画面に出す顧客向けの短文**（codes.Interpretation.display）。
+        summary は**診断レポート（開発側）**が読む。★画面に summary を出さない（宛先が違う・■I）。
         """
         now = _now_iso()
         with self._lock:
@@ -64,6 +67,7 @@ class RecentCodes:
                     "protocol": protocol,
                     "summary": summary,
                     "target": target,
+                    "display": display,
                     "source": source,
                     "first_at": now,
                     "last_at": now,

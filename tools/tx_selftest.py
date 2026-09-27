@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
+import isolation  # noqa: E402  ← ir_bridge より先に（置き場所ごと一時ディレクトリへ逃がす・前後で本物を見張る）
+
 from ir_bridge import codes, config  # noqa: E402
 from ir_bridge.codes import LightTarget, SceneTarget  # noqa: E402
 from ir_bridge.lirc import LircDevice  # noqa: E402
@@ -511,4 +513,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(isolation.run(main))

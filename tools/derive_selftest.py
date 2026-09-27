@@ -14,6 +14,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tools/
+
+import isolation  # noqa: E402  ← ir_bridge より先に（置き場所ごと一時ディレクトリへ逃がす・前後で本物を見張る）
 
 from ir_bridge import codes  # noqa: E402
 from ir_bridge.codes import LightTarget, SceneTarget  # noqa: E402
@@ -316,7 +319,7 @@ def _config_section() -> int:
 
         print("■ learned は1行の破損で全体を捨てない（顧客が全ボタンを失わないため）")
         raw = {
-            "format": 1,
+            "schema_version": 1,
             "entries": {
                 "nec:0x4008": {"target": {"scene": "scene_01"}, "label": "テレビの青"},
                 "こわれた": {"target": {"scene": "scene_02"}},
@@ -359,8 +362,13 @@ def _config_section() -> int:
             check("未記載の照明は brightness_lists に現れない（既定は設定UI側の1つだけ）",
                   "9" not in back.brightness_lists, str(back.brightness_lists))
             check("記載のある照明は指定どおり", back.brightness_lists["3"] == [0, 10, 30, 60, 100])
-            check("format が入っている",
-                  json.loads(config.SETTINGS_FILE.read_text())["format"] == config.SETTINGS_FORMAT)
+            check("schema_version が入っている（settings）",
+                  json.loads(config.SETTINGS_FILE.read_text())["schema_version"] == config.SETTINGS_SCHEMA_VERSION == 1)
+            check("schema_version が入っている（learned）",
+                  json.loads(config.LEARNED_FILE.read_text())["schema_version"] == config.LEARNED_SCHEMA_VERSION == 1)
+            check("旧 format キーは書かない（版番号のキーを2つ持たない）",
+                  "format" not in json.loads(config.SETTINGS_FILE.read_text())
+                  and "format" not in json.loads(config.LEARNED_FILE.read_text()))
             check("一時ファイルが残らない", not list(Path(d).glob("*.tmp")), str(list(Path(d).glob("*"))))
             check("権限は600", oct(config.SETTINGS_FILE.stat().st_mode)[-3:] == "600")
 
@@ -702,14 +710,14 @@ def _reload_section() -> int:
                 config.SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
                 config.LEARNED_FILE.write_text(json.dumps(learned), encoding="utf-8")
 
-            write({"format": 1, "base": "0x4b6a", "debounce_ms": 700, "brightness_lists": {"3": [0, 60]}},
-                  {"format": 1, "entries": {"nec:0x4008": {"target": {"scene": "scene_07"}, "label": "青"}}})
+            write({"schema_version": 1, "base": "0x4b6a", "debounce_ms": 700, "brightness_lists": {"3": [0, 60]}},
+                  {"schema_version": 1, "entries": {"nec:0x4008": {"target": {"scene": "scene_07"}, "label": "青"}}})
             store = config.ConfigStore(config.load())
             check("初回読み込み: base", store.get().base == codes.PRESETS[1], hex(store.get().base))
 
             print("  — 壊れた learned を差し替える（壊れた行だけ捨てて常駐は生きる）")
-            write({"format": 1, "base": "0x4b6a", "debounce_ms": 700, "brightness_lists": {}},
-                  {"format": 1, "entries": {
+            write({"schema_version": 1, "base": "0x4b6a", "debounce_ms": 700, "brightness_lists": {}},
+                  {"schema_version": 1, "entries": {
                       "nec:0x4008": {"target": {"scene": "scene_07"}, "label": "青"},
                       "こわれた": {"target": {"scene": "scene_08"}},
                       "nec:0x4005": "文字列",
@@ -718,15 +726,18 @@ def _reload_section() -> int:
             new = store.reload()
             check("読める2件が残る", len(new.learned) == 2, str(sorted(k[0] for k in new.learned)))
             check("正常な行は生きている", new.learned.get(code_to_bytes("nec:0x4008")) is not None)
-            check("壊れた行の WARNING が出る",
-                  len([m for lv, m in handler.records if lv == "WARNING"]) == 2,
-                  str([m for lv, m in handler.records if lv == "WARNING"]))
+            warns = [m for lv, m in handler.records if lv == "WARNING"]
+            check("壊れた行の WARNING が行ごとに出る",
+                  len([m for m in warns if m.startswith("learned の項目を無視")]) == 2, str(warns))
+            check("  ファイルごとのまとめ1行（元の中身を保全した旨・W18）",
+                  len([m for m in warns if "learned.json の一部（2件" in m and ".unreadable" in m]) == 1, str(warns))
+            check("  WARNING はそれで全部（3行）", len(warns) == 3, str(warns))
             check("常駐は続く（例外を投げない）", True)
 
             print("  — 構造条件を破る base を差し替える（起動時と同じ扱いになること）")
             handler.records.clear()
-            write({"format": 1, "base": "0x2ed1", "debounce_ms": 700, "brightness_lists": {}},
-                  {"format": 1, "entries": {}})
+            write({"schema_version": 1, "base": "0x2ed1", "debounce_ms": 700, "brightness_lists": {}},
+                  {"schema_version": 1, "entries": {}})
             new = store.reload()
             check("既定値へフォールバックする", new.base == codes.DEFAULT_BASE, hex(new.base))
             check("理由が WARNING に出る",
@@ -738,9 +749,9 @@ def _reload_section() -> int:
 
             print("  — brightness_lists の範囲検証も差し替え時に効く")
             handler.records.clear()
-            write({"format": 1, "base": "0x7d2e", "debounce_ms": 700,
+            write({"schema_version": 1, "base": "0x7d2e", "debounce_ms": 700,
                    "brightness_lists": {"3": [0, 101, 50, -1]}},
-                  {"format": 1, "entries": {}})
+                  {"schema_version": 1, "entries": {}})
             new = store.reload()
             check("0-100 の外は捨てられる", new.brightness_lists == {"3": [0, 50]}, str(new.brightness_lists))
         finally:
@@ -798,4 +809,4 @@ def _reload_section() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(isolation.run(main))

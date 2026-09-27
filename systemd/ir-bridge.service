@@ -2,9 +2,9 @@
 Description=EchoBridge IR Bridge (addon)
 # 本体とネット到達後に開始。ただし Requires= は入れない設計判断（HAP版・Matter版と同じ）:
 # 本体restart時にアドオンを道連れにしない。
-# ★骨格段階の本アドオンは本体API(:8099)を一切叩かないため、この順序制約は現状は無意味である。
-#   将来IR実装が本体APIを消費する（例: シーン発火に赤外線を紐づける）ときのために先に置く。
-#   After= は「起動していれば先に」でしかなく、本体不達でも本アドオンは起動する。
+# 本アドオンは M2 から本体API(:8099) を叩く（受信コード→シーン発火・輝度設定）。
+#   After= は「起動していれば先に」でしかなく、本体不達でも本アドオンは起動する
+#   （起動時に HTTP を叩かないため。ir_bridge/main.py）。
 After=network-online.target echobridge-shortcut-api.service
 Wants=network-online.target
 
@@ -15,6 +15,8 @@ WorkingDirectory=%REPO%
 # 起動時ローテ: error_addon.log が1MB超なら .old へ退避（世代1・上書き）。
 # systemdがStandardErrorでファイルを開く前に走るためappendのinode問題を踏まない。
 # クラッシュループでも再起動毎に走るので最悪1MB+αで頭打ち。%%s はunit内で%sへ復元される。
+# ★これは起動時だけ。稼働中の回転はアドオン側（ir_bridge/errlog.py）が同じ閾値・同じ .old 名で行う
+#   （API_CONTRACT.md §6-2「稼働中も上限を持つこと」・W18）。閾値を変えるときは両方を揃えること。
 ExecStartPre=/bin/sh -c '[ -f %REPO%/data/error_addon.log ] && [ $(stat -c%%s %REPO%/data/error_addon.log) -gt 1048576 ] && mv -f %REPO%/data/error_addon.log %REPO%/data/error_addon.log.old || true'
 # ログの権限を data/ の他の生成物（status.json＝600）と揃える。
 # StandardError=append: は mode を指定できず、systemd が新規作成すると root:root 644 になる。
@@ -24,12 +26,12 @@ ExecStartPre=/bin/sh -c '[ -f %REPO%/data/error_addon.log ] && [ $(stat -c%%s %R
 #   **失敗しても起動を妨げない**（install.sh を経ずに手で起動した機体で上がらなくなるのを避ける）。
 ExecStartPre=/bin/sh -c 'f=%REPO%/data/error_addon.log; touch "$f" 2>/dev/null; chmod 600 "$f" 2>/dev/null; true'
 ExecStart=%PYTHON% -m ir_bridge.main
-# 標準ライブラリのみで動く＝venvもrequirements.txtも持たない（CLAUDE.md §8）。
+# 標準ライブラリのみで動く＝venvもrequirements.txtも持たない（CLAUDE.md §11）。
 # stdoutがpipe(journal)だとPythonはブロックバッファする＝ログが数KB溜まるまで出ない。
 # 本体webuiのunitと同じくバッファを切り、INFOが即journalへ届くようにする。
 Environment=PYTHONUNBUFFERED=1
-# /dev/lirc0・/dev/lirc1 は root:video 660。IR送受信の実装（M2以降）でこれを開く。
-# 骨格の時点で入れておくのは、あとから足すと「動かない原因はこれ」の切り分けを毎回踏むため。
+# /dev/lirc* は root:video 660。受信（/dev/lircN を MODE2 で直接 read）と送信（ir-ctl）が
+# これを開く。デバイス番号は決め打ちしない——役割は LIRC_GET_FEATURES で判定する（CLAUDE.md §12）。
 # ★SupplementaryGroups= は User= のユーザが /etc/group 経由で属する群を**置換せず、加える**
 #   （dev機の echobridge は既に video 所属なので実質no-opだが、非所属の機体でも効く保険）。
 SupplementaryGroups=video
@@ -66,13 +68,19 @@ Environment=IR_BRIDGE_RX_DEVICE=auto
 EnvironmentFile=-%REPO%/data/env
 Restart=on-failure
 RestartSec=5
-# 実測（骨格・Python標準ライブラリのみ）は RSS≈12MiB / cgroup課金≈6MiB。上限は本体webui(200M)と同値に置き、
-# Matter版(300M)より小さくする＝逼迫時にはMatterより先に本アドオンが死ぬ順序にはならないが、
-# 本体(未設定=0)より先に死ぬ側であることは下のOOMScoreAdjustで担保する。
-# 200Mは将来のIR実装（コードDB・lirc入出力）への余裕であって、現状の実測に対しては過大である。
-# IR実装後に実測し直して締める（DEV_LOG 2026-08-14）。
-MemoryMax=200M
-# 本体(未設定=0)より先にkillされる側＝「逼迫時に死ぬのはアドオン側」(CLAUDE.md §4)の実装。
+# 上限 64M（受け渡しW15_ir-bridge_MemoryMax・2026-09-16 改訂／09-17 追補。DEV_LOG 2026-09-19 W18）。
+# 実測（本体セッションが測定・dev 機＝Pi5 2GB・16K ページ・2026-09-15・約4時間の窓・IR 実装後）:
+#   MemoryCurrent 13.3MiB / memory.peak 17.2MiB / anon 12.8MiB。memory.events の max・oom・oom_kill は 0。
+#   （参考: 骨格時点 2026-08-14 の dev 機で RSS≈12MiB / cgroup課金≈6MiB。DEV_LOG M1-B）
+# 64M の根拠は上の実測に対する2点:
+#   (1) 比: 64M はピーク 17.2MiB の約3.7倍（200M だと約11.6倍で過大）。
+#   (2) 隔離: 約47MiB 増えた時点で本アドオンだけが自分の天井で落ち、Restart=on-failure で戻る。
+#       上限が大きいと、その間は他 unit と同じ物理メモリを取り合う。
+# 32M まで締めない: cgroup は page cache も課金する。学習操作・設定画面・/diagnostics の同時利用の実測がまだ無い。
+# Pi4 1GB（出荷相当）での IR 実測はまだ無い。見直す条件は受け渡しW15 §5
+# （1週間以上の memory.peak が 32MiB 超／memory.events の max・oom_kill が 0 でなくなった）。
+MemoryMax=64M
+# 本体(未設定=0)より先にkillされる側＝「逼迫時に死ぬのはアドオン側」(CLAUDE.md §5)の実装。
 OOMScoreAdjust=500
 
 [Install]

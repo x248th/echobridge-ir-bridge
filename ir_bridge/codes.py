@@ -99,13 +99,18 @@ class Interpretation(NamedTuple):
     """受信コードの解釈結果。ログ・RecentCodes・発火の3者がこれ1つを見る。
 
     target が None なら発火しない（未登録・範囲外・別プリセット）。
-    reason は人に見せる短文で、そのままログにも設定UIにも出せる形にしてある。
+    reason は**ログと診断レポート（開発側）**に出す短文。
+    display は**設定UIの受信ログ（顧客）**に出す短文で、宛先が無い行だけが持つ。
+    ★2つを使い回さない（宛先が違う・UI調整 ■I）。以前は reason を画面にもそのまま出していて、
+    「未登録（learned にも導出にも一致せず）」のような開発者の語が顧客の画面に出ていた。
+    display は「何もしなかった」ことが分かる形で終える（顧客は照明が動かなかった理由を探している）。
     """
 
     target: Target | None
     reason: str
-    # source: learned / derived / other_preset / out_of_range / unknown
+    # source: learned / derived / other_preset / out_of_range / foreign_necx / unknown
     source: str
+    display: str = ""
 
 
 def base_bytes(base: int) -> tuple[int, int]:
@@ -296,6 +301,10 @@ def decode(base: int, raw: Bytes4) -> Interpretation | None:
                         f"現在はプリセット{preset_number(base)} です"
                     ),
                     source="other_preset",
+                    display=(
+                        f"プリセット{preset_number(other)} のコードです"
+                        f"（いまはプリセット{preset_number(base)} なので、何もしません）"
+                    ),
                 )
         return None
 
@@ -315,6 +324,7 @@ def decode(base: int, raw: Bytes4) -> Interpretation | None:
                 "誤動作が起きるならプリセットを切り替えること"
             ),
             source="foreign_necx",
+            display="他の機器のリモコンです（何もしません）",
         )
 
     if b3 == SCENE_INSTANCE:
@@ -329,6 +339,7 @@ def decode(base: int, raw: Bytes4) -> Interpretation | None:
             target=None,
             reason=f"導出コードだが輝度 {b2} が範囲外（0〜{MAX_BRIGHTNESS}）のため本体へ投げない",
             source="out_of_range",
+            display="本機のコードとして読めませんでした（何もしません）",
         )
 
     return Interpretation(LightTarget(b3, b2), "", "derived")

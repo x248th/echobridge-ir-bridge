@@ -16,7 +16,11 @@ ADDON_ID="ir-bridge"
 SERVICE_NAME="$ADDON_ID"
 UNIT_SRC="$REPO_DIR/systemd/$SERVICE_NAME.service"
 UNIT_DST="/etc/systemd/system/$SERVICE_NAME.service"
-UNIT_TMP="/tmp/$SERVICE_NAME.service.$$"
+# 一時ファイルは mktemp で作る（W19-19）。このスクリプトは root で走り、`$$` は予測できる
+# ＝同名のシンボリックリンクを先に置かれると root 権限の書き込みを別の場所へ向けられる
+# （カーネルの protected_symlinks 任せにしない。同じスクリプトの STARTUP_MARKER は
+# 最初から mktemp を使っていて、ここだけ古い形が残っていた）。
+UNIT_TMP="$(mktemp "${TMPDIR:-/tmp}/$SERVICE_NAME.service.XXXXXX")"
 # sudoers: 本体WebUIがアドオンを起動/停止/再起動するための最小権限（手動visudo工程を廃止）。
 # ★ファイル名だけは echobridge-addon-<id> のフル形にする（matter/hap の実物と同じ:
 #   unit=matter-bridge.service に対し /etc/sudoers.d/echobridge-addon-matter-bridge）。
@@ -24,7 +28,9 @@ UNIT_TMP="/tmp/$SERVICE_NAME.service.$$"
 #   どの製品のものか分からず、本体側の一括撤去がプレフィクスで拾う場合にも漏れるため。
 #   **許可対象のコマンドに書くのは unit名（$SERVICE_NAME）** で、ここが本体の呼び方と一致する。
 SUDOERS_DST="/etc/sudoers.d/echobridge-addon-$ADDON_ID"
-SUDOERS_TMP="/tmp/echobridge-addon-$ADDON_ID.$$"
+SUDOERS_TMP="$(mktemp "${TMPDIR:-/tmp}/echobridge-addon-$ADDON_ID.XXXXXX")"
+# どの経路で抜けても一時ファイルを残さない（上の2つは中断時にも消える）。
+trap 'rm -f "$UNIT_TMP" "$SUDOERS_TMP"' EXIT
 SYSTEMCTL="$(command -v systemctl)"
 PYTHON_BIN="$(command -v python3 || true)"
 STATUS_JSON="$REPO_DIR/data/status.json"
@@ -69,15 +75,23 @@ if [ "$USER_NAME" = "root" ] && [ -n "${SUDO_USER:-}" ]; then
     echo "==> sudo実行を検出: USER=$USER_NAME を対象にする"
 fi
 
-# 1. ランタイム確認（依存インストールは無い。外部パッケージを使わない設計＝CLAUDE.md §8）。
+# 1. ランタイム確認（依存インストールは無い。外部パッケージを使わない設計＝CLAUDE.md §11）。
 if [ -z "$PYTHON_BIN" ]; then
     echo "!! python3 が見つからない。" >&2
     exit 1
 fi
-"$PYTHON_BIN" - <<'PY' || { echo "!! Python 3.9 以上が必要。" >&2; exit 1; }
-import sys
-sys.exit(0 if sys.version_info >= (3, 9) else 1)
-PY
+# ★3.10 以上（3.9 ではない・W19-9）。実装は PEP 604 の `X | Y` 型表記を、**実行時に評価される
+#   位置**（関数シグネチャの既定値・NamedTuple のクラス本体・モジュール直下の型別名）で使っており、
+#   `from __future__ import annotations` では救えない。3.9 の機体では、このランタイム確認を
+#   通過したうえで `python3 -m ir_bridge.main` が import 時に TypeError で落ち、
+#   起動確認が 90秒待って失敗する＝顧客には原因の書かれていない「インストールに失敗しました」
+#   だけが残る。ここで止めて理由を出す。
+PY_VER="$("$PYTHON_BIN" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "不明")"
+if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+    echo "!! Python 3.10 以上が必要（この機体は $PY_VER: $PYTHON_BIN）。" >&2
+    echo "!! Raspberry Pi OS なら Bookworm 以降（Bullseye の 3.9 では動かない）。" >&2
+    exit 1
+fi
 
 # 2. data/（status.json・error_addon.log・将来のIRコードDBの置き場。gitignore済み）
 mkdir -p "$REPO_DIR/data"
@@ -90,11 +104,35 @@ touch "$REPO_DIR/data/error_addon.log"
 chown "$USER_NAME" "$REPO_DIR/data/error_addon.log"
 chmod 600 "$REPO_DIR/data/error_addon.log"
 
+# 2b. ~/addon-data/ir-bridge/（settings.json・learned.json の置き場所。アンインストールしても残る）
+#     API_CONTRACT.md §6-1: 作成と所有者は install.sh の責務（本体は作らない）。本体のヘルパーは
+#     本スクリプトを root で呼ぶので、所有者をサービス実行ユーザへ揃える（data/ と同じ形）。
+#     ホームは $HOME ではなくパスワードDBから取る（sudo／ヘルパー経由では $HOME が root のことがある）。
+#     2回目以降の実行では mkdir -p が何もせず、chown も同じ値を書くだけ＝中身には触れない。
+USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+    echo "!! $USER_NAME のホームディレクトリが分からない（getent passwd）。" >&2
+    exit 1
+fi
+ADDON_DATA_ROOT="$USER_HOME/addon-data"
+CONFIG_DIR="$ADDON_DATA_ROOT/$ADDON_ID"
+# 親の ~/addon-data/ は他のアドオンと共有する。**無いときだけ**作ってユーザへ渡す
+# （root 所有のまま残すと、アドオンが起動時に自分の id を作り直せない）。在れば所有者に触れない。
+if [ ! -d "$ADDON_DATA_ROOT" ]; then
+    mkdir -p "$ADDON_DATA_ROOT"
+    chown "$USER_NAME" "$ADDON_DATA_ROOT"
+fi
+mkdir -p "$CONFIG_DIR"
+chown "$USER_NAME" "$CONFIG_DIR"
+echo "==> 設定の置き場所: $CONFIG_DIR（アンインストールしても残る）"
+
 # 3. unitテンプレートのプレースホルダを実パスに置換 → 配置
-echo "==> systemd unit配置: $UNIT_DST"
+# ★出力は**行ってから**出す（CLAUDE.md §24「予定や試みを結果として書かない」。W19-18）。
+#   この出力は顧客と本体の導入ヘルパーが読む。
 sed -e "s|%REPO%|$REPO_DIR|g" -e "s|%USER%|$USER_NAME|g" -e "s|%PYTHON%|$PYTHON_BIN|g" "$UNIT_SRC" > "$UNIT_TMP"
 sudo cp "$UNIT_TMP" "$UNIT_DST"
 rm -f "$UNIT_TMP"
+echo "==> systemd unit配置: $UNIT_DST"
 
 # 4. sudoers 自動配置（本体WebUIのアドオン起動/停止/再起動をNOPASSWDで許可）
 #    一時ファイルに生成 → visudo -c で構文検証 → 合格時のみ配置（検証失敗なら配置せず中断）。
@@ -103,7 +141,8 @@ rm -f "$UNIT_TMP"
 #      systemctl disable --now ir-bridge.service
 #      systemctl restart       ir-bridge.service
 #    ※本体のホワイトリストには W14（本体 commit 70e9cb1）で登録済み。本体WebUIのトグルがこれを撃つ。
-echo "==> sudoers生成・検証: $SUDOERS_DST"
+# ★配置の結果は下の分岐で出す。ここは予定の形にする（W19-18）。
+echo "==> sudoers を生成して visudo -c で検証する: $SUDOERS_DST"
 cat > "$SUDOERS_TMP" <<SUDO
 # EchoBridge 赤外線アドオン: 本体WebUIがアドオンを起動/停止/再起動するための最小権限。
 # install.sh が visudo -c 検証を通してから配置する（手動 visudo 工程は不要）。
@@ -140,7 +179,8 @@ cat <<EOF
 ==> インストール完了。
     状態:     systemctl status $SERVICE_NAME
     ログ:     journalctl -u $SERVICE_NAME -f
-    異常ログ: data/error_addon.log（WARNING以上のみ・起動時に1MB超で.oldへローテ）
+    異常ログ: data/error_addon.log（WARNING以上のみ・1MB超で .old へ回す）
+    設定:     $CONFIG_DIR（アンインストールしても残る）
 
     起動/停止は本体の管理画面（アドオンのカード）から行えます。
     設定画面: http://<この機体のアドレス>:8100/（同じネットワークの端末から開けます）
